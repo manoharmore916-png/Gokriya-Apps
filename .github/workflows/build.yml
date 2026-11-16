@@ -1,0 +1,140 @@
+name: Build Gokriya APKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: franchise
+            appId: com.gokriya.franchise
+            appName: Gokriya Franchise
+          - app: plant
+            appId: com.gokriya.plant
+            appName: Gokriya Plant
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Extract source ZIP
+        run: |
+          set -e
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: repo मध्ये .zip file सापडली नाही"
+            ls -la
+            exit 1
+          fi
+          echo "Using ZIP: $ZIP"
+          rm -rf source
+          mkdir source
+          unzip -q -o "$ZIP" -d source
+          PKG=$(find source -name package.json -not -path '*/node_modules/*' | head -n 1)
+          if [ -z "$PKG" ]; then
+            echo "ERROR: package.json सापडला नाही"
+            find source -maxdepth 4
+            exit 1
+          fi
+          ROOT=$(dirname "$PKG")
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+          ls -la "$ROOT"
+
+      - name: Prepare web files
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          rm -rf www android
+          mkdir www
+          test -f "${{ matrix.app }}/index.html" || { echo "ERROR: ${{ matrix.app }}/index.html नाही"; ls -R . | head -50; exit 1; }
+          cp -r "${{ matrix.app }}/." www/
+          cp -r shared/. www/
+          ls -la www
+
+      - name: Install dependencies
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          npm install --no-audit --no-fund
+
+      - name: Write Capacitor config
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "${{ matrix.appId }}",
+            "appName": "${{ matrix.appName }}",
+            "webDir": "www",
+            "server": { "androidScheme": "https" },
+            "plugins": { "CapacitorHttp": { "enabled": true } }
+          }
+          EOF
+          cat capacitor.config.json
+
+      - name: Add Android platform
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          npx cap add android
+
+      - name: Ensure Android internet permission
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET" />\n    <application#' "$MANIFEST"
+          fi
+          echo "Internet permission:"
+          grep -n "INTERNET" "$MANIFEST"
+
+      - name: Sync web assets
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          npx cap sync android
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Build APK
+        run: |
+          set -e
+          cd "$PROJECT_ROOT/android"
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$PROJECT_ROOT/android/app/build/outputs/apk/debug/app-debug.apk" "$GITHUB_WORKSPACE/out/Gokriya-${{ matrix.app }}.apk"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gokriya-${{ matrix.app }}-APK
+          path: out/Gokriya-${{ matrix.app }}.apk
